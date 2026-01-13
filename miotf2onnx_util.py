@@ -185,56 +185,89 @@ def remove_unused_inputs(graph_def, inputs):
 
 
 def generate_random_initializer(initializer):
-    # 根据数据类型生成随机数据
+    """为 ONNX initializer 生成合理的随机数据。
+
+    之前的实现对所有类型都用 `np.random.rand`：
+    - 对 int/bool 会先生成 float 再 cast，分布不直观；
+    - 对空 shape/标量 shape 等边界情况不够明确；
+
+    这里做了更稳妥的处理：
+    - float/float16: 正态分布（均值0，方差较小），更接近权重初始化
+    - int32/int64: small range 随机整数
+    - bool: 0/1 伯努利
+    """
+
     import numpy as np
 
     data_type = initializer.data_type
-    dims = initializer.dims
+    dims = list(initializer.dims)
 
-    # 处理不同数据类型
+    # ONNX 里 initializer 允许标量（dims=[]）
+    shape = tuple(int(d) for d in dims)
+
     if data_type == onnx.TensorProto.FLOAT:
-        np_dtype = np.float32
-    elif data_type == onnx.TensorProto.FLOAT16:
-        np_dtype = np.float16
-    elif data_type == onnx.TensorProto.INT32:
-        np_dtype = np.int32
-    elif data_type == onnx.TensorProto.INT64:
-        np_dtype = np.int64
-    elif data_type == onnx.TensorProto.BOOL:
-        np_dtype = bool
-    else:
-        raise NotImplementedError(f"Unsupported data type: {data_type}")
-
-    # 生成随机数据
-    random_data = np.random.rand(*dims).astype(np_dtype)
-
-    # 对于布尔类型特殊处理（np.random.rand生成 0-1，转为 True/False）
+        return np.random.normal(loc=0.0, scale=0.02, size=shape).astype(np.float32)
+    if data_type == onnx.TensorProto.FLOAT16:
+        return np.random.normal(loc=0.0, scale=0.02, size=shape).astype(np.float16)
+    if data_type == onnx.TensorProto.INT32:
+        return np.random.randint(low=-128, high=128, size=shape, dtype=np.int32)
+    if data_type == onnx.TensorProto.INT64:
+        # numpy randint 不支持 dtype=int64 的所有版本参数一致，这里先生成再 astype
+        return np.random.randint(low=-128, high=128, size=shape).astype(np.int64)
     if data_type == onnx.TensorProto.BOOL:
-        random_data = random_data > 0.5
+        return (np.random.rand(*shape) > 0.5) if shape else (np.random.rand() > 0.5)
 
-    return random_data
+    raise NotImplementedError(f"Unsupported data type: {data_type}")
 
 
-def fill_random_weights_to_onnx_model(empty_params_model, output_path, params):
+def fill_random_weights_to_onnx_model(
+    empty_params_model,
+    output_path: str,
+    params,
+    *,
+    save_as_external_data: bool = True,
+    all_tensors_to_one_file: bool = True,
+    external_data_filename: str | None = None,
+):
+    """把指定 params 对应的 initializer 填充随机权重并保存。
+
+    优化点：
+    1) 之前 `initializer_data` 没有被使用，去掉。
+    2) 使用 `params_set` 加速匹配。
+    3) 支持自定义 external data 文件名（避免默认命名不稳定）。
+    """
+
     from onnx import numpy_helper
 
     model = onnx.ModelProto()
     model.CopyFrom(empty_params_model)
-    initializer_data = {}
-    # 遍历所有initializer
-    for initializer in model.graph.initializer:
-        if initializer.name in params:
-            random_array = generate_random_initializer(initializer)
-            # 转换为 TensorProto并更新 raw_data
-            initializer.CopyFrom(
-                numpy_helper.from_array(random_array, name=initializer.name)
-            )
-            initializer_data[initializer.name] = random_array
 
+    params_set = set(params)
+    filled = 0
+
+    for initializer in model.graph.initializer:
+        if initializer.name not in params_set:
+            continue
+        random_array = generate_random_initializer(initializer)
+        initializer.CopyFrom(numpy_helper.from_array(random_array, name=initializer.name))
+        filled += 1
+
+    if external_data_filename is None:
+        # 默认使用输出 onnx 文件名 + .bin，避免多个模型共享同一个 weights.bin
+        base = os.path.basename(output_path)
+        base_no_ext = os.path.splitext(base)[0]
+        external_data_filename = f"{base_no_ext}.bin"
+
+    # `onnx.save` 在 save_as_external_data=True 时，会把大 tensor 写到 external data
+    # 并且 `location` 默认可能变化；这里显式指定 all_tensors_to_one_file 和文件名
     onnx.save(
-        model, output_path, save_as_external_data=True, all_tensors_to_one_file=True
+        model,
+        output_path,
+        save_as_external_data=save_as_external_data,
+        all_tensors_to_one_file=all_tensors_to_one_file,
+        location=external_data_filename,
     )
-    print(f"✅ save random weight onnx to '{output_path}' success! ")
+    print(f"✅ save random weight onnx to '{output_path}' success! filled={filled}")
 
 
 def recover_params_as_initializer(onnx_model, params):
